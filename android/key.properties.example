@@ -1,0 +1,6 @@
+# Copy to android/key.properties (git-ignored) and fill in your own values.
+# storeFile can be absolute or relative to the Android app module directory.
+storeFile=../volume-buttons-uploadkey.jks
+storePassword=your-store-password
+keyAlias=volume-buttons
+keyPassword=your-key-password

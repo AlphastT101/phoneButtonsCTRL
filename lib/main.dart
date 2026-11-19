@@ -1,14 +1,16 @@
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
-// GitHub dark, pure black canvas.
-const _bg = Color(0xFF000000);
-const _surface = Color(0xFF161B22);
-const _border = Color(0xFF30363D);
-const _text = Color(0xFFE6EDF3);
-const _muted = Color(0xFF8B949E);
-const _subtle = Color(0xFF3D444D);
-const _accent = Color(0xFFF0883E);
+// Pixel / Material 3 dark palette.
+const _bg = Color(0xFF0F1115);
+const _surface = Color(0xFF1B1C1F);
+const _surfaceHigh = Color(0xFF26272B);
+const _divider = Color(0xFF2E3033);
+const _text = Color(0xFFE3E3E3);
+const _muted = Color(0xFF9AA0A6);
+const _accent = Color(0xFFA8C7FA);
+const _onAccent = Color(0xFF00315D);
+const _iconOff = Color(0xFFC4C7C5);
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,7 +18,7 @@ void main() {
     const SystemUiOverlayStyle(
       statusBarColor: Colors.transparent,
       statusBarIconBrightness: Brightness.light,
-      systemNavigationBarColor: Color(0xFF000000),
+      systemNavigationBarColor: _bg,
       systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
@@ -28,6 +30,19 @@ class VolumeButtonsApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = ColorScheme.fromSeed(
+      seedColor: const Color(0xFF4285F4),
+      brightness: Brightness.dark,
+    ).copyWith(
+      primary: _accent,
+      onPrimary: _onAccent,
+      surface: _surface,
+      onSurface: _text,
+      secondaryContainer: _surfaceHigh,
+      onSecondaryContainer: _text,
+      outline: _divider,
+    );
+
     return MaterialApp(
       title: 'Volume Buttons',
       debugShowCheckedModeBanner: false,
@@ -36,30 +51,49 @@ class VolumeButtonsApp extends StatelessWidget {
         useMaterial3: true,
         brightness: Brightness.dark,
         scaffoldBackgroundColor: _bg,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: _accent,
-          brightness: Brightness.dark,
-        ).copyWith(surface: _surface, primary: _accent),
+        colorScheme: scheme,
         dialogTheme: const DialogThemeData(
           backgroundColor: _surface,
           surfaceTintColor: Colors.transparent,
           shape: RoundedRectangleBorder(
-            side: BorderSide(color: _border),
-            borderRadius: BorderRadius.all(Radius.circular(12)),
+            borderRadius: BorderRadius.all(Radius.circular(28)),
+          ),
+          titleTextStyle: TextStyle(
+            fontSize: 19,
+            fontWeight: FontWeight.w600,
+            color: _text,
+          ),
+          contentTextStyle: TextStyle(
+            fontSize: 14,
+            height: 1.5,
+            color: _muted,
+          ),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            backgroundColor: _accent,
+            foregroundColor: _onAccent,
+            textStyle: const TextStyle(fontWeight: FontWeight.w600),
+            shape: const StadiumBorder(),
+            padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 12),
           ),
         ),
         snackBarTheme: const SnackBarThemeData(
           behavior: SnackBarBehavior.floating,
-          backgroundColor: Color(0xFF21262D),
+          backgroundColor: _surfaceHigh,
           contentTextStyle: TextStyle(color: _text),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(16)),
+          ),
         ),
         switchTheme: SwitchThemeData(
           thumbColor: WidgetStateProperty.resolveWith(
-            (states) => states.contains(WidgetState.selected) ? _accent : _subtle,
+            (states) => states.contains(WidgetState.selected) ? _onAccent : _iconOff,
           ),
           trackColor: WidgetStateProperty.resolveWith(
-            (states) =>
-                states.contains(WidgetState.selected) ? const Color(0x40F0883E) : const Color(0xFF21262D),
+            (states) => states.contains(WidgetState.selected)
+                ? _accent
+                : const Color(0xFF3C4043),
           ),
           trackOutlineColor: WidgetStateProperty.all(Colors.transparent),
         ),
@@ -125,7 +159,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         _pendingEnable = false;
         await _enable();
       }
-      return;
     }
     await _refresh();
   }
@@ -162,17 +195,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void _showOverlayDialog() {
     showDialog<void>(
       context: context,
-      barrierColor: Colors.black54,
+      barrierColor: Colors.black.withValues(alpha: 0.6),
       builder: (context) => AlertDialog(
-        title: const Text(
-          'Display over other apps',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: _text),
-        ),
+        title: const Text('Display over other apps'),
         content: const Text(
-          'Android needs this so the button can float above other apps. Volume Buttons will be '
-          'selected on the next screen — just flip the switch.',
-          style: TextStyle(fontSize: 13, height: 1.5, color: _muted),
+          'Android needs this so the sound panel can float above other apps. '
+          'Volume Buttons will be selected on the next screen — just flip the switch.',
         ),
+        actionsPadding: const EdgeInsets.fromLTRB(12, 0, 16, 12),
         actions: [
           TextButton(
             onPressed: () {
@@ -187,11 +217,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               Navigator.of(context).pop();
               _channel.invokeMethod('openOverlaySettings');
             },
-            style: FilledButton.styleFrom(
-              backgroundColor: _accent,
-              foregroundColor: Colors.black,
-              textStyle: const TextStyle(fontWeight: FontWeight.w700),
-            ),
             child: const Text('Open settings'),
           ),
         ],
@@ -209,73 +234,168 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     return Scaffold(
       backgroundColor: _bg,
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(18, 20, 18, 18),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Volume Buttons',
-                style: TextStyle(
-                  fontSize: 22,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: -0.2,
-                  color: _text,
-                ),
-              ),
-              const SizedBox(height: 6),
-              const Text(
-                'Volume keys dead? This replaces them.',
-                style: TextStyle(fontSize: 13, height: 1.4, color: _muted),
-              ),
-              const SizedBox(height: 24),
-              _buildToggleCard(),
-              const SizedBox(height: 14),
-              const Text(
-                'The orange tab sits on the left or right edge of your screen. Drag it to move it, tap it to open the volume slider.',
-                style: TextStyle(fontSize: 12, height: 1.5, color: _muted),
-              ),
-              const Spacer(),
-            ],
-          ),
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 28),
+          children: [
+            _buildHeader(),
+            const SizedBox(height: 28),
+            _buildToggleCard(),
+            const SizedBox(height: 28),
+            _buildPermissionNote(),
+          ],
         ),
       ),
     );
   }
 
+  Widget _buildHeader() {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Container(
+          width: 50,
+          height: 50,
+          decoration: const BoxDecoration(color: _accent, shape: BoxShape.circle),
+          child: const Icon(Icons.graphic_eq_rounded, color: _onAccent, size: 27),
+        ),
+        const SizedBox(width: 14),
+        const Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Volume Buttons',
+                style: TextStyle(
+                  fontSize: 25,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: -0.5,
+                  color: _text,
+                ),
+              ),
+              SizedBox(height: 2),
+              Text(
+                'Sound controls, always within reach.',
+                style: TextStyle(fontSize: 13, color: _muted),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildToggleCard() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.fromLTRB(18, 18, 14, 16),
       decoration: BoxDecoration(
         color: _surface,
-        borderRadius: BorderRadius.circular(12),
-        border: const Border.fromBorderSide(BorderSide(color: _border)),
+        borderRadius: BorderRadius.circular(28),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: _enabled ? _accent : _surfaceHigh,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.tune_rounded,
+                  size: 23,
+                  color: _enabled ? _onAccent : _iconOff,
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Floating control',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                        color: _text,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Row(
+                      children: [
+                        Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: _enabled ? _accent : _muted,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          _enabled ? 'Active on your screen edge' : 'Turned off',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: _enabled ? _accent : _muted,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: _enabled,
+                onChanged: _busy ? null : _onToggle,
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          const Divider(height: 1, thickness: 1, color: _divider),
+          const SizedBox(height: 14),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 1),
+                child: Icon(Icons.touch_app_rounded, size: 17, color: _muted),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  _enabled
+                      ? 'Tap the blue tab on your edge to open sound controls. Drag it to move sides.'
+                      : 'Enable it and a blue tab appears on your screen edge, above every app.',
+                  style: const TextStyle(fontSize: 12.5, height: 1.45, color: _muted),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPermissionNote() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: _surface,
+        borderRadius: BorderRadius.circular(22),
       ),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  'Floating volume button',
-                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: _text),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  _enabled ? 'On — the tab is on your screen edge' : 'Off',
-                  style: TextStyle(
-                    fontSize: 12,
-                    height: 1.3,
-                    color: _enabled ? _accent : _muted,
-                  ),
-                ),
-              ],
+          const Icon(Icons.info_outline_rounded, size: 19, color: _accent),
+          const SizedBox(width: 11),
+          const Expanded(
+            child: Text(
+              'Android needs “Display over other apps” for the floating tab. '
+              'The app opens the exact settings page for you. Sideloaded installs may also need '
+              '“Allow restricted settings” once.',
+              style: TextStyle(fontSize: 12, height: 1.5, color: _muted),
             ),
-          ),
-          Switch(
-            value: _enabled,
-            onChanged: _busy ? null : _onToggle,
           ),
         ],
       ),

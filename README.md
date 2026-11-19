@@ -2,28 +2,45 @@
 
 **Your volume keys died? This brings them back.**
 
-Volume Buttons is a floating edge button for Android that replaces broken or
-unresponsive hardware volume keys. An always-on overlay tab sits flush against
-the left or right screen edge; tap it and a slider pops out above every app.
+Volume Buttons is a floating edge control for Android that replaces broken or
+unresponsive hardware volume keys. A slim tab sits against the left or right
+screen edge; tap it and a sound panel opens above every app.
 
 ## Features
 
-- **Always-on edge tab** — half-tab, flush against the screen border, 60% transparent when idle, fades further when untouched
-- **Slider on tap** — vertical media-volume slider with a thin line and a dash handle (no bulky circle), haptic tick per step
-- **Close without leaving** — tap the ✕ or anywhere outside the card
-- **Left or right side** — drag the tab across the screen; it snaps to the nearest edge and flips its flat side and chevron automatically
-- **Dark & minimal** — GitHub-dark UI, pure black background, orange accent, no animations, no clutter
-- **Works everywhere** — pure `TYPE_APPLICATION_OVERLAY` + foreground service, no OEM-specific hooks; Android 8+ (API 26+)
-- **Restores on boot** — with the enabled state, it tries to come back after a reboot (falls back to a tap-to-restore notification when the platform blocks it)
+- **Five volume streams** — Media, Call, Ring, Notifications and Alarm, each
+  with a labelled horizontal slider and a live percentage
+- **Smooth sliders** — the thumb follows your finger continuously, glides to the
+  tapped position instead of jumping, and gives a small haptic tick per step
+- **Ring or vibrate** — switch ringer mode from the panel in one tap (Silent is
+  not offered because Android 16 routes it through Do Not Disturb, where it
+  still vibrates on this ROM)
+- **Call mute link** — muting Call also mutes Notifications and keeps them muted
+  after the call stream is restored; Notifications stays locked until unmuted
+- **Tap an icon to mute** — tap a stream icon to mute or unmute that stream
+- **Either edge** — drag the tab across the screen; it snaps to the nearest edge
+  and flips its flat side and chevron automatically
+- **Readable everywhere** — the card is fully opaque when cross-window blur is
+  unavailable, so no app text shows through; on devices with blur it stays
+  slightly translucent for a native Pixel feel
+- **Small, quiet idle tab** — 24 × 76 dp with a low idle opacity so it stays out
+  of the way until you need it
+- **Works everywhere** — `TYPE_APPLICATION_OVERLAY` + foreground service,
+  no OEM-specific hooks; Android 8+ (API 26+)
+- **Restores on boot** — with the enabled state, it comes back after a reboot
 - **Zero tracking** — 100% offline, no accounts, no analytics, no network
 
 ## How it works
 
 The app runs a small foreground service that keeps a transparent `FrameLayout`
 overlay window pinned to the screen edge. The overlay hosts two states: a
-collapsed chevron tab and an expanded volume card with a custom canvas-drawn
-`VerticalVolumeSlider`. The volume buttons stream `AudioManager.STREAM_MUSIC`,
-so it behaves exactly like the hardware keys for media volume.
+collapsed chevron tab and an expanded sound card with five custom canvas-drawn
+`HorizontalVolumeSlider` views. Each slider drives its own `AudioManager` stream,
+so it behaves like the hardware keys for that stream.
+
+The card background is chosen at runtime: fully opaque `#1E1F22` when
+`WindowManager.isCrossWindowBlurEnabled` is false, and 95% opaque with
+`FLAG_BLUR_BEHIND` when the device supports cross-window blur.
 
 ## Permissions
 
@@ -31,7 +48,9 @@ so it behaves exactly like the hardware keys for media volume.
 |---|---|
 | **Display over other apps** (`SYSTEM_ALERT_WINDOW`) | The overlay can't exist without it |
 | **Foreground service** (`SPECIAL_USE`) | Keeps the button alive against ROM battery savers |
-| **Notifications** (`POST_NOTIFICATIONS`) | Required to show "Floating volume control is active" |
+| **Notifications** (`POST_NOTIFICATIONS`) | Required to show "Floating sound controls are active" |
+| **Modify audio settings** (`MODIFY_AUDIO_SETTINGS`) | Changes stream volumes and ringer mode |
+| **Vibrate** (`VIBRATE`) | Haptic ticks on the sliders |
 | **Request ignored battery optimizations** | Optional — prevents aggressive ROMs killing the service |
 
 If a permission is missing when you tap the toggle, the app walks you through
@@ -78,11 +97,11 @@ above). The toggle and one-time battery-exemption prompt live in the app.
 ## Project layout
 
 ```
-lib/main.dart                              — the app UI (toggle + on-demand permission flow)
-android/app/src/main/kotlin/.../MainActivity.kt   — MethodChannel bridge
-.../VolumeOverlayService.kt                — foreground service, overlay window, drag/snap logic
-.../VerticalVolumeSlider.kt                — canvas-drawn slider (line + dash handle)
-.../BootReceiver.kt                        — restart on boot (with fallback notification)
+lib/main.dart                                      — Pixel-blue app UI (toggle + permission flow)
+android/app/src/main/kotlin/.../MainActivity.kt    — MethodChannel bridge
+.../VolumeOverlayService.kt                        — foreground service, overlay window, drag/snap
+.../HorizontalVolumeSlider.kt                      — canvas-drawn smooth slider
+.../BootReceiver.kt                                — restart on boot
 ```
 
 ## License

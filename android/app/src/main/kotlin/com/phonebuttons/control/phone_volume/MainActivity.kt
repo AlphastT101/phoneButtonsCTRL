@@ -2,11 +2,8 @@ package com.phonebuttons.control.phone_volume
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -14,7 +11,6 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
 
     private val channelName = "volume_buttons/overlay"
-    private val notifRequestCode = 4242
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -22,11 +18,6 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "hasOverlayPermission" ->
                     result.success(Settings.canDrawOverlays(this))
-
-                "requestNotificationPermission" -> {
-                    requestNotificationPermissionIfNeeded()
-                    result.success(null)
-                }
 
                 "askBatteryOptimizationIfNeeded" -> {
                     askBatteryOptimizationIfNeeded()
@@ -49,21 +40,6 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun prefs() = getSharedPreferences(VolumeOverlayService.PREF, MODE_PRIVATE)
-
-    private fun requestNotificationPermissionIfNeeded() {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(
-                this,
-                android.Manifest.permission.POST_NOTIFICATIONS,
-            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
-                notifRequestCode,
-            )
-        }
-    }
 
     /**
      * Non-blocking, once-per-install prompt: asks the system to exclude the app from

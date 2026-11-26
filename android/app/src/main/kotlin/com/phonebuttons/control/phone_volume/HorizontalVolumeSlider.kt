@@ -12,16 +12,17 @@ import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
-import android.view.animation.DecelerateInterpolator
+import android.view.animation.AccelerateDecelerateInterpolator
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Material 3 / Pixel style horizontal slider.
+ * System-style horizontal volume bar: a full-width pill with a blue fill up to
+ * the current position and a thin vertical handle at the boundary.
  *
- * The knob follows the finger continuously (no step snapping while dragging), while the
- * underlying stream value is quantized to the audio stream's real steps. Programmatic
- * changes (hardware keys, mute links) glide to their new position instead of teleporting.
+ * Dragging follows the finger continuously. Tapping somewhere on the bar glides
+ * the handle to that position instead of teleporting. All bar animations use
+ * ease-in-out; the window resize animations use ease-out.
  */
 class HorizontalVolumeSlider @JvmOverloads constructor(
     context: Context,
@@ -39,59 +40,43 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
     private var currentValue = 0
     val value: Int get() = currentValue
 
-    var muted: Boolean = false
-        set(v) {
-            if (field != v) {
-                field = v
-                invalidate()
-            }
-        }
-
     var isDragging: Boolean = false
         private set
 
     private val density = resources.displayMetrics.density
-    private val trackHeight = 10 * density
-    private val thumbRadius = 9 * density
-    private val horizontalPad = 12 * density
+    private val horizontalPad = 3f * density
+    private val handleWidth = 12f * density
+    private val handleOvershoot = 5f * density
+    private val gapHalf = 24f * density
     private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop
 
     private var fraction = 0f
-    private var thumbScale = 1f
     private var moveAnimator: ValueAnimator? = null
     private var glideAnimator: ValueAnimator? = null
     private var glideCanceled = false
-    private var thumbAnimator: ValueAnimator? = null
     private var downX = 0f
 
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#3C4043")
+        color = Color.parseColor("#292933")
     }
     private val activePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#A8C7FA")
+        color = Color.parseColor("#71D2FF")
     }
-    private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#D3E3FD")
-    }
-    private val thumbRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 2 * density
-        color = Color.parseColor("#1E1F22")
-    }
-    private val thumbShadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#4D000000")
+    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#71D2FF")
     }
 
     init {
         isFocusable = true
         contentDescription = "Volume"
+        setWillNotDraw(false)
     }
 
     fun setValue(value: Int, animate: Boolean) {
         val clamped = value.coerceIn(0, max)
         if (isDragging || isGliding) return
         val target = clamped.toFloat() / max.toFloat()
-        if (clamped == currentValue && kotlin.math.abs(fraction - target) < 0.001f) return
+        if (clamped == currentValue && abs(fraction - target) < 0.001f) return
         currentValue = clamped
         moveAnimator?.cancel()
         if (!animate || width == 0 || !isShown) {
@@ -100,8 +85,8 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
             return
         }
         moveAnimator = ValueAnimator.ofFloat(fraction, target).apply {
-            duration = 190L
-            interpolator = DecelerateInterpolator()
+            duration = 200L
+            interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener {
                 fraction = it.animatedValue as Float
                 invalidate()
@@ -128,22 +113,32 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
         val right = width - horizontalPad
         if (right <= left) return
 
-        val cy = height / 2f
-        val top = cy - trackHeight / 2f
-        val bottom = cy + trackHeight / 2f
-        val radius = trackHeight / 2f
+        val top = 0f
+        val bottom = height.toFloat()
+        val radius = bottom / 2f
 
-        canvas.drawRoundRect(left, top, right, bottom, radius, radius, trackPaint)
-
-        val thumbX = left + (right - left) * fraction
+        // Two separate pills with a gap around the handle, as in the system UI.
+        val handleX = left + (right - left) * fraction
+        val blueEnd = (handleX - gapHalf).coerceIn(left, right)
+        val greyStart = (handleX + gapHalf).coerceIn(left, right)
         if (fraction > 0.001f) {
-            canvas.drawRoundRect(left, top, thumbX, bottom, radius, radius, activePaint)
+            canvas.drawRoundRect(left, top, blueEnd, bottom, radius, radius, activePaint)
+        }
+        if (fraction < 0.999f) {
+            canvas.drawRoundRect(greyStart, top, right, bottom, radius, radius, trackPaint)
         }
 
-        val r = thumbRadius * thumbScale
-        canvas.drawCircle(thumbX, cy + 1 * density, r + 3 * density, thumbShadowPaint)
-        canvas.drawCircle(thumbX, cy, r + 2 * density, thumbRingPaint)
-        canvas.drawCircle(thumbX, cy, r, thumbPaint)
+        // Thin vertical handle, slightly taller than the bar.
+        val cy = (top + bottom) / 2f
+        canvas.drawRoundRect(
+            handleX - handleWidth / 2f,
+            cy - bottom / 2f - handleOvershoot,
+            handleX + handleWidth / 2f,
+            cy + bottom / 2f + handleOvershoot,
+            handleWidth / 2f,
+            handleWidth / 2f,
+            handlePaint,
+        )
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -155,34 +150,26 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
                 glideAnimator?.cancel()
                 isDragging = true
                 downX = event.x
-                animateThumb(1.22f)
                 val targetValue = (fractionForX(event.x) * max).roundToInt().coerceIn(0, max)
                 val target = targetValue.toFloat() / max.toFloat()
-                if (abs(target - fraction) > 0.01f) {
-                    glideTo(target)
-                } else {
-                    updateFromTouch(event.x, haptic = false)
-                }
+                if (abs(target - fraction) > 0.01f) glideTo(target) else updateFromTouch(event.x, false)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 if (isDragging) {
-                    // Ignore finger jitter while a tap glide is running; only take over
-                    // once the finger actually travels past the touch slop.
                     if (isGliding && abs(event.x - downX) <= touchSlop) return true
                     if (isGliding) {
                         glideCanceled = true
                         glideAnimator?.cancel()
                         glideAnimator = null
                     }
-                    updateFromTouch(event.x, haptic = true)
+                    updateFromTouch(event.x, true)
                 }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (isDragging) {
                     isDragging = false
-                    animateThumb(1f)
                     if (event.actionMasked == MotionEvent.ACTION_UP && !isGliding) performClick()
                 }
                 return true
@@ -218,15 +205,11 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
         }
     }
 
-    /**
-     * Tap-to-position: glide the thumb to the tapped spot instead of teleporting,
-     * then commit the resulting volume in one update when the glide finishes.
-     */
     private fun glideTo(target: Float) {
         glideCanceled = false
         glideAnimator = ValueAnimator.ofFloat(fraction, target).apply {
-            duration = 180L
-            interpolator = DecelerateInterpolator()
+            duration = 200L
+            interpolator = AccelerateDecelerateInterpolator()
             addUpdateListener {
                 fraction = it.animatedValue as Float
                 invalidate()
@@ -238,24 +221,9 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
 
                 override fun onAnimationEnd(animation: Animator) {
                     glideAnimator = null
-                    if (!glideCanceled) {
-                        emitValue(fraction, haptic = true)
-                    }
+                    if (!glideCanceled) emitValue(fraction, true)
                 }
             })
-            start()
-        }
-    }
-
-    private fun animateThumb(to: Float) {
-        thumbAnimator?.cancel()
-        thumbAnimator = ValueAnimator.ofFloat(thumbScale, to).apply {
-            duration = 120L
-            interpolator = DecelerateInterpolator()
-            addUpdateListener {
-                thumbScale = it.animatedValue as Float
-                invalidate()
-            }
             start()
         }
     }
@@ -264,7 +232,6 @@ class HorizontalVolumeSlider @JvmOverloads constructor(
         moveAnimator?.cancel()
         glideAnimator?.cancel()
         glideAnimator = null
-        thumbAnimator?.cancel()
         super.onDetachedFromWindow()
     }
 }

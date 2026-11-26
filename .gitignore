@@ -49,3 +49,7 @@ app.*.map.json
 
 # Kotlin compile cache
 **/.kotlin/
+
+# Local UI reference screenshots
+/image.png
+/image copy.png

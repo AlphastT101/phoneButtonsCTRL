@@ -185,7 +185,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _enable() async {
-    await _channel.invokeMethod('requestNotificationPermission');
     await _channel.invokeMethod('askBatteryOptimizationIfNeeded');
     final ok = await _channel.invokeMethod<bool>('startOverlay') ?? false;
     if (mounted) setState(() => _enabled = ok);
@@ -365,7 +364,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
               Expanded(
                 child: Text(
                   _enabled
-                      ? 'Tap the blue tab on your edge to open sound controls. Drag it to move sides.'
+                      ? 'Tap the edge tab for a media slider. The logo at the bottom opens every stream.'
                       : 'Enable it and a blue tab appears on your screen edge, above every app.',
                   style: const TextStyle(fontSize: 12.5, height: 1.45, color: _muted),
                 ),

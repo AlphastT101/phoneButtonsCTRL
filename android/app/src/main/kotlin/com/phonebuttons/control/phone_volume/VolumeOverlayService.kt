@@ -1,5 +1,9 @@
 package com.phonebuttons.control.phone_volume
 
+import android.animation.ArgbEvaluator
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,7 +14,6 @@ import android.content.res.ColorStateList
 import android.database.ContentObserver
 import android.graphics.Color
 import android.graphics.PixelFormat
-import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.media.AudioManager
@@ -26,7 +29,6 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
-import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Space
@@ -36,13 +38,16 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Always-on edge overlay that replaces broken hardware volume keys.
+ * Floating edge control that replaces broken hardware volume keys.
  *
- * Collapsed: a small blue half-pill flush with the screen edge.
- * Expanded: a Material 3 / Pixel-style sound panel with ring modes and five
- * continuously-draggable volume streams. The card uses window blur on devices
- * that support cross-window blur (Android 12+), and is fully opaque when it is not
- * available so nothing underneath shows through.
+ * TAB   — small blue half-pill flush with the screen edge.
+ * MINI  — compact media-only modal: ring/vibrate button, vertical media bar,
+ *         and a "more" button (reference image 2).
+ * FULL  — full-width modal with five labelled horizontal bars (reference image 1).
+ *
+ * State changes animate the overlay window itself with an ease-out resize;
+ * the modal contents fade in quickly once the resize finishes. Slider motion
+ * uses ease-in-out.
  */
 class VolumeOverlayService : android.app.Service() {
 
@@ -55,65 +60,76 @@ class VolumeOverlayService : android.app.Service() {
 
     private var screenW = 1080
     private var screenH = 2400
-    private var panelWidthPx = 0
 
     private var scrimView: View? = null
     private var scrimLp: WindowManager.LayoutParams? = null
     private var rootView: FrameLayout? = null
     private var panelLp: WindowManager.LayoutParams? = null
-    private var collapsedView: ImageView? = null
-    private var expandedView: LinearLayout? = null
+
+    private var tabView: ImageView? = null
+    private var surface: FrameLayout? = null
+    private var surfaceDrawable: GradientDrawable? = null
+    private var surfaceColor = TAB_BLUE
+    private var surfaceRadius = 14f
+    private var surfaceMargins = IntArray(4)
+
+    private var miniContent: LinearLayout? = null
+    private var miniSlider: VerticalVolumeSlider? = null
+    private var miniRingerIcon: ImageView? = null
+    private var fullContent: LinearLayout? = null
 
     private val rows = LinkedHashMap<Int, VolumeRow>()
-    private val modeChips = LinkedHashMap<Int, ModeChip>()
     private val lastVolume = HashMap<Int, Int>()
     private var callMuted = false
     private var enforceGuard = false
 
-    private var isExpanded = false
+    private enum class OverlayState { TAB, MINI, FULL }
+    private var state = OverlayState.TAB
     private var onRightSide = true
     private var attached = false
 
+    private var transition: ValueAnimator? = null
+    private var transitionGeneration = 0
+
     private val density get() = resources.displayMetrics.density
     private fun Int.dp() = (this * density).toInt()
+    /** Convert a coordinate from the 1080px-wide reference images to this display. */
+    private fun ref(px: Int): Int = (px * density / 2.7f).roundToInt()
+    private fun lerp(a: Int, b: Int, t: Float) = (a + (b - a) * t).roundToInt()
+    private fun lerp(a: Float, b: Float, t: Float) = a + (b - a) * t
 
-    // Pixel / Material 3 dark palette with Pixel blue.
-    private val blue = Color.parseColor("#A8C7FA")
-    private val onBlue = Color.parseColor("#00315D")
-    private val textPrimary = Color.parseColor("#E3E3E3")
-    private val textSecondary = Color.parseColor("#9AA0A6")
-    private val iconIdle = Color.parseColor("#C4C7C5")
-    private val scrimColor = Color.parseColor("#66000000")
+    // Reference palette (sampled from the two screenshots).
+    private val teal = Color.parseColor("#003547")
+    private val blue = Color.parseColor("#71D2FF")
+    private val labelColor = Color.parseColor("#B0B0B0")
+    private val scrimColor = Color.TRANSPARENT
     private val rippleLight = Color.parseColor("#33FFFFFF")
-    private val rippleDark = Color.parseColor("#4000315D")
 
     private data class StreamDef(val stream: Int, val iconRes: Int, val label: String)
-    private data class RingerDef(val mode: Int, val label: String, val iconRes: Int)
     private class VolumeRow(
         val def: StreamDef,
         val slider: HorizontalVolumeSlider,
         val icon: ImageView,
-        val label: TextView,
-        val percent: TextView,
-        val iconButton: FrameLayout,
     )
-    private class ModeChip(
-        val container: LinearLayout,
-        val icon: ImageView,
-        val label: TextView,
+
+    private data class Target(
+        val state: OverlayState,
+        val w: Int,
+        val h: Int,
+        val x: Int,
+        val y: Int,
+        val margins: IntArray,
+        val radius: Float,
+        val color: Int,
+        val alpha: Float,
     )
 
     private val streams = listOf(
         StreamDef(AudioManager.STREAM_MUSIC, R.drawable.ic_media, "Media"),
         StreamDef(AudioManager.STREAM_VOICE_CALL, R.drawable.ic_call, "Call"),
         StreamDef(AudioManager.STREAM_RING, R.drawable.ic_ring, "Ring"),
-        StreamDef(AudioManager.STREAM_NOTIFICATION, R.drawable.ic_notif, "Notifications"),
+        StreamDef(AudioManager.STREAM_NOTIFICATION, R.drawable.ic_notif, "Notification"),
         StreamDef(AudioManager.STREAM_ALARM, R.drawable.ic_alarm, "Alarm"),
-    )
-
-    private val ringerModes = listOf(
-        RingerDef(AudioManager.RINGER_MODE_NORMAL, "Ring", R.drawable.ic_ring_mode),
-        RingerDef(AudioManager.RINGER_MODE_VIBRATE, "Vibrate", R.drawable.ic_vibrate),
     )
 
     companion object {
@@ -123,13 +139,17 @@ class VolumeOverlayService : android.app.Service() {
         const val KEY_Y = "overlay_y"
         const val CHANNEL_ID = "volume_overlay_channel"
         const val NOTIFICATION_ID = 7001
-        private const val BUTTON_DP = 24
-        private const val BUTTON_HEIGHT_DP = 76
-        private const val PANEL_DP = 340
+        private const val TAB_W_DP = 24
+        private const val TAB_H_DP = 76
+        private const val MINI_W_REF = 238
+        private const val MINI_H_REF = 1079
+        private const val FULL_W_REF = 918
+        private const val FULL_H_REF = 950
         private const val EDGE_MARGIN_DP = 8
         private const val FADE_DELAY_MS = 3500L
         private const val COLLAPSED_ALPHA = 0.85f
         private const val COLLAPSED_IDLE_ALPHA = 0.30f
+        private const val TAB_BLUE = 0xFFA8C7FA.toInt()
     }
 
     override fun onCreate() {
@@ -155,7 +175,7 @@ class VolumeOverlayService : android.app.Service() {
         registerObservers()
         enforceCallNotifLink()
         updateAllRows(animate = false)
-        refreshModeChips()
+        refreshMiniRinger()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -165,15 +185,47 @@ class VolumeOverlayService : android.app.Service() {
 
     override fun onBind(intent: Intent?) = null
 
-    // ---------------------------------------------------------- views
+    // ---------------------------------------------------------- view setup
 
     private fun attachViews() {
         if (attached) return
         attached = true
 
-        scrimView = View(this).apply {
+        // Small tab window — touchable only while collapsed.
+        tabView = ImageView(this).apply {
+            setImageResource(tabChevron())
+            setBackgroundResource(tabBackground())
+            imageTintList = ColorStateList.valueOf(Color.parseColor("#00315D"))
+            scaleType = ImageView.ScaleType.CENTER
+            setPadding(4.dp(), 4.dp(), 4.dp(), 4.dp())
+            alpha = COLLAPSED_ALPHA
+            contentDescription = "Open sound controls"
+        }
+        attachDrag(tabView!!)
+
+        rootView = FrameLayout(this).apply {
+            clipChildren = false
+            addView(tabView, FrameLayout.LayoutParams(TAB_W_DP.dp(), TAB_H_DP.dp()))
+        }
+        val startY = coerceY(prefs.getInt(KEY_Y, screenH / 3), TAB_H_DP.dp())
+        panelLp = WindowManager.LayoutParams(
+            TAB_W_DP.dp(),
+            TAB_H_DP.dp(),
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = edgeX(TAB_W_DP.dp())
+            y = startY
+        }
+        addWindowSafe(rootView!!, panelLp!!)
+
+        // Full-screen modal window. Window size never changes; only the card
+        // view inside it animates, which is GPU-accelerated and lag-free.
+        scrimView = FrameLayout(this).apply {
             setBackgroundColor(scrimColor)
-            alpha = 0f
+            clipChildren = false
             setOnClickListener { collapse() }
         }
         scrimLp = WindowManager.LayoutParams(
@@ -184,216 +236,179 @@ class VolumeOverlayService : android.app.Service() {
             PixelFormat.TRANSLUCENT,
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            // WindowManager caps non-touchable overlay windows at 0.8 alpha.
             alpha = 0.79f
         }
         addWindowSafe(scrimView!!, scrimLp!!)
 
-        collapsedView = ImageView(this).apply {
-            setImageResource(tabChevron())
-            setBackgroundResource(tabBackground())
-            imageTintList = ColorStateList.valueOf(onBlue)
-            scaleType = ImageView.ScaleType.CENTER
-            setPadding(4.dp(), 4.dp(), 4.dp(), 4.dp())
-            alpha = COLLAPSED_ALPHA
-            contentDescription = "Open sound controls"
+        surfaceDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = surfaceRadius * density
+            setColor(TAB_BLUE)
         }
-        attachDrag(collapsedView!!)
-
-        panelWidthPx = min(PANEL_DP.dp(), screenW - 2 * EDGE_MARGIN_DP.dp())
-        expandedView = buildPanel().apply {
-            visibility = View.GONE
+        surface = FrameLayout(this).apply {
+            background = surfaceDrawable
             alpha = 0f
-        }
-        applyCardSurface()
-        attachDrag(expandedView!!)
-
-        rootView = FrameLayout(this).apply {
-            addView(collapsedView, FrameLayout.LayoutParams(BUTTON_DP.dp(), BUTTON_HEIGHT_DP.dp()))
-            addView(expandedView, FrameLayout.LayoutParams(panelWidthPx, ViewGroup.LayoutParams.WRAP_CONTENT))
+            clipChildren = false
         }
 
-        val startY = coerceY(prefs.getInt(KEY_Y, screenH / 3), BUTTON_HEIGHT_DP.dp())
-        panelLp = WindowManager.LayoutParams(
-            BUTTON_DP.dp(),
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT,
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = edgeX(BUTTON_DP.dp())
-            y = startY
-        }
-        addWindowSafe(rootView!!, panelLp!!)
+        miniContent = buildMini()
+        fullContent = buildFull()
+        surface!!.addView(miniContent, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        surface!!.addView(fullContent, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        hideContent(miniContent!!)
+        hideContent(fullContent!!)
+
+        val initial = geometry(OverlayState.TAB, panelLp!!.y + TAB_H_DP.dp() / 2).rect()
+        (scrimView as FrameLayout).addView(
+            surface,
+            FrameLayout.LayoutParams(initial[2], initial[3], Gravity.TOP or Gravity.START).apply {
+                leftMargin = initial[0]
+                topMargin = initial[1]
+            },
+        )
         scheduleFade()
     }
 
-    private fun buildPanel(): LinearLayout {
+    /** Compact modal: ring/vibrate circle, vertical media bar, more button. */
+    private fun buildMini(): LinearLayout {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(18.dp(), 10.dp(), 18.dp(), 14.dp())
-            setBackgroundResource(R.drawable.overlay_card_bg)
-            clipToOutline = true
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(ref(40), ref(24), ref(40), ref(20))
+            clipChildren = false
         }
 
-        // Sheet-style grabber.
-        val grabWrap = FrameLayout(this)
-        grabWrap.addView(
-            View(this).apply { background = roundedDrawable(Color.parseColor("#5F6368"), 2) },
-            FrameLayout.LayoutParams(34.dp(), 4.dp(), Gravity.CENTER),
-        )
-        card.addView(grabWrap, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 12.dp()))
+        // Small blue dot above the controls.
+        card.addView(View(this).apply {
+            background = ovalDrawable(blue)
+        }, LinearLayout.LayoutParams(ref(10), ref(10)).apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+        })
 
-        // Header.
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        // Ring / vibrate circle.
+        val ringer = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            background = ovalRipple(blue)
+            contentDescription = "Switch ring and vibrate"
+            setOnClickListener { toggleMiniRinger() }
         }
-        header.addView(TextView(this).apply {
-            text = "Sound & vibration"
-            textSize = 20f
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            setTextColor(textPrimary)
-            includeFontPadding = false
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        header.addView(ImageButton(this).apply {
-            setImageResource(R.drawable.ic_close)
-            imageTintList = ColorStateList.valueOf(iconIdle)
-            scaleType = ImageView.ScaleType.CENTER
-            setPadding(8.dp(), 8.dp(), 8.dp(), 8.dp())
-            background = roundedDrawable(Color.TRANSPARENT, 18, rippleLight)
-            contentDescription = "Close"
-            setOnClickListener { collapse() }
-        }, LinearLayout.LayoutParams(36.dp(), 36.dp()))
-        card.addView(header, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 42.dp(),
-        ).apply { topMargin = 4.dp() })
-
-        // Ring mode segmented control.
-        card.addView(buildModeSelector(), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 44.dp(),
-        ).apply { topMargin = 12.dp() })
-
-        // Stream rows.
-        var first = true
-        for (def in streams) {
-            card.addView(buildRow(def), LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = if (first) 12.dp() else 2.dp() })
-            first = false
+        miniRingerIcon = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            setPadding(ref(24), ref(24), ref(24), ref(24))
+            imageTintList = ColorStateList.valueOf(teal)
         }
+        ringer.addView(miniRingerIcon, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        card.addView(ringer, LinearLayout.LayoutParams(ref(96), ref(96)).apply {
+            topMargin = ref(12)
+        })
 
-        refreshModeChips()
+        // Vertical media bar.
+        val slider = VerticalVolumeSlider(this).apply {
+            max = getMaxVolume(AudioManager.STREAM_MUSIC)
+            setValueImmediate(displayVolume(AudioManager.STREAM_MUSIC))
+            contentDescription = "Media volume"
+            onStepChanged = { value -> onSliderValue(AudioManager.STREAM_MUSIC, value) }
+        }
+        miniSlider = slider
+        card.addView(slider, LinearLayout.LayoutParams(ref(108), ref(600)).apply {
+            topMargin = ref(32)
+        })
+
+        card.addView(Space(this), LinearLayout.LayoutParams(1, 0, 1f))
+
+        // "More" button opens the full panel.
+        card.addView(ImageView(this).apply {
+            setImageResource(R.drawable.ic_tune)
+            imageTintList = ColorStateList.valueOf(blue)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = "All sound controls"
+            isClickable = true
+            isFocusable = true
+            background = roundedDrawable(Color.TRANSPARENT, 20, rippleLight)
+            setOnClickListener { showFull() }
+        }, LinearLayout.LayoutParams(ref(56), ref(56)).apply {
+            bottomMargin = ref(16)
+        })
+
         return card
     }
 
-    private fun buildModeSelector(): LinearLayout {
-        val container = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(3.dp(), 3.dp(), 3.dp(), 3.dp())
-            background = roundedDrawable(Color.parseColor("#2A2B2E"), 22)
+    /** Full modal: five labelled bars, each with its stream icon inside. */
+    private fun buildFull(): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(ref(48), ref(48), ref(48), ref(60))
+            clipChildren = false
         }
-        ringerModes.forEachIndexed { index, def ->
-            val chip = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-                isClickable = true
-                isFocusable = true
-                background = roundedDrawable(Color.TRANSPARENT, 19, rippleLight)
-                setOnClickListener { selectRingerMode(def.mode) }
-            }
-            val icon = ImageView(this).apply {
-                setImageResource(def.iconRes)
-                imageTintList = ColorStateList.valueOf(iconIdle)
-                scaleType = ImageView.ScaleType.FIT_CENTER
-            }
-            chip.addView(icon, LinearLayout.LayoutParams(15.dp(), 15.dp()).apply {
-                marginEnd = 6.dp()
+        for (def in streams) {
+            card.addView(buildFullRow(def), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                bottomMargin = ref(30)
             })
-            val label = TextView(this).apply {
-                text = def.label
-                textSize = 12f
-                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-                setTextColor(iconIdle)
-                includeFontPadding = false
-            }
-            chip.addView(label)
-            container.addView(chip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                marginStart = if (index == 0) 0 else 2.dp()
-            })
-            modeChips[def.mode] = ModeChip(chip, icon, label)
         }
-        return container
+        return card
     }
 
-    private fun buildRow(def: StreamDef): LinearLayout {
+    private fun buildFullRow(def: StreamDef): LinearLayout {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 2.dp(), 0, 2.dp())
+            clipChildren = false
         }
 
-        val top = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        val iconButton = FrameLayout(this).apply {
-            isClickable = true
-            isFocusable = true
-            background = roundedDrawable(Color.TRANSPARENT, 13, rippleLight)
-            setOnClickListener { toggleMute(def.stream) }
-        }
-        val icon = ImageView(this).apply {
-            setImageResource(def.iconRes)
-            imageTintList = ColorStateList.valueOf(iconIdle)
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            setPadding(3.dp(), 3.dp(), 3.dp(), 3.dp())
-        }
-        iconButton.addView(icon, FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
-        ))
-        top.addView(iconButton, LinearLayout.LayoutParams(26.dp(), 26.dp()))
-
-        val label = TextView(this).apply {
+        row.addView(TextView(this).apply {
             text = def.label
-            textSize = 13.5f
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            setTextColor(textPrimary)
+            textSize = 14f
+            setTextColor(labelColor)
             includeFontPadding = false
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ref(44)))
+
+        val bar = FrameLayout(this).apply {
+            clipChildren = false
         }
-        top.addView(label, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { marginStart = 8.dp() })
-
-        top.addView(Space(this), LinearLayout.LayoutParams(0, 1, 1f))
-
-        val percent = TextView(this).apply {
-            textSize = 12f
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            setTextColor(textSecondary)
-            includeFontPadding = false
-            gravity = Gravity.END
-        }
-        top.addView(percent)
-
-        val max = try { audio.getStreamMaxVolume(def.stream) } catch (_: Exception) { 15 }
+        val max = getMaxVolume(def.stream)
         val slider = HorizontalVolumeSlider(this).apply {
-            this.max = max.coerceAtLeast(1)
+            this.max = max
             setValue(displayVolume(def.stream), false)
             contentDescription = "${def.label} volume"
             onValueChanged = { value -> onSliderValue(def.stream, value) }
         }
-
-        row.addView(top, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        bar.addView(slider, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ref(84),
         ))
-        row.addView(slider, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 38.dp(),
-        ).apply { topMargin = 1.dp() })
 
-        rows[def.stream] = VolumeRow(def, slider, icon, label, percent, iconButton)
-        refreshRow(def.stream, animate = false)
+        val iconButton = FrameLayout(this).apply {
+            isClickable = true
+            isFocusable = true
+            background = roundedDrawable(Color.TRANSPARENT, 14, rippleLight)
+            contentDescription = "Mute ${def.label}"
+            setOnClickListener { toggleMute(def.stream) }
+        }
+        val icon = ImageView(this).apply {
+            setImageResource(def.iconRes)
+            imageTintList = ColorStateList.valueOf(blue)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setPadding(ref(8), ref(8), ref(8), ref(8))
+        }
+        iconButton.addView(icon, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+        ))
+        bar.addView(iconButton, FrameLayout.LayoutParams(ref(44), ref(44), Gravity.END or Gravity.CENTER_VERTICAL).apply {
+            marginEnd = ref(36)
+        })
+
+        row.addView(bar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ref(84),
+        ).apply { topMargin = ref(12) })
+
+        rows[def.stream] = VolumeRow(def, slider, icon)
         return row
     }
 
@@ -446,8 +461,7 @@ class VolumeOverlayService : android.app.Service() {
     }
 
     private fun applyVolume(stream: Int, value: Int) {
-        val max = getMaxVolume(stream)
-        val target = value.coerceIn(1, max)
+        val target = value.coerceIn(1, getMaxVolume(stream))
         try {
             audio.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, 0)
         } catch (_: Exception) {
@@ -477,7 +491,6 @@ class VolumeOverlayService : android.app.Service() {
     private fun toggleMute(stream: Int) {
         if (stream == AudioManager.STREAM_NOTIFICATION && isCallMuted()) return
         if (isRingerSilent() && (stream == AudioManager.STREAM_RING || stream == AudioManager.STREAM_NOTIFICATION)) {
-            // The row reads "Silent" because of the ringer mode; tapping it returns to Ring.
             selectRingerMode(AudioManager.RINGER_MODE_NORMAL)
             return
         }
@@ -487,7 +500,7 @@ class VolumeOverlayService : android.app.Service() {
         } else {
             muteStream(stream)
         }
-        expandedView?.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        rootView?.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
         refreshRow(stream, animate = true)
         if (stream == AudioManager.STREAM_VOICE_CALL) refreshRow(AudioManager.STREAM_NOTIFICATION, animate = true)
     }
@@ -498,18 +511,13 @@ class VolumeOverlayService : android.app.Service() {
                 audio.ringerMode = AudioManager.RINGER_MODE_NORMAL
             } catch (_: Exception) {
             }
-            refreshModeChips()
         }
         if (stream == AudioManager.STREAM_NOTIFICATION && isCallMuted()) {
             enforceCallNotifLink()
             refreshRow(stream, animate = false)
             return
         }
-        if (value <= 0) {
-            muteStream(stream)
-        } else {
-            applyVolume(stream, value)
-        }
+        if (value <= 0) muteStream(stream) else applyVolume(stream, value)
         if (stream == AudioManager.STREAM_VOICE_CALL) {
             enforceCallNotifLink()
             refreshRow(AudioManager.STREAM_NOTIFICATION, animate = false)
@@ -524,10 +532,19 @@ class VolumeOverlayService : android.app.Service() {
         enforceGuard = true
         try {
             muteStream(AudioManager.STREAM_NOTIFICATION)
-            rows[AudioManager.STREAM_NOTIFICATION]?.let { refreshRow(AudioManager.STREAM_NOTIFICATION, animate = true) }
+            refreshRow(AudioManager.STREAM_NOTIFICATION, animate = true)
         } finally {
             enforceGuard = false
         }
+    }
+
+    private fun toggleMiniRinger() {
+        val vibrate = try {
+            audio.ringerMode == AudioManager.RINGER_MODE_VIBRATE
+        } catch (_: Exception) {
+            false
+        }
+        selectRingerMode(if (vibrate) AudioManager.RINGER_MODE_NORMAL else AudioManager.RINGER_MODE_VIBRATE)
     }
 
     private fun selectRingerMode(mode: Int) {
@@ -536,12 +553,23 @@ class VolumeOverlayService : android.app.Service() {
         } catch (e: Exception) {
             android.util.Log.w("VolumeButtons", "ringer mode change to $mode failed", e)
         }
-        expandedView?.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        rootView?.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
         handler.postDelayed({
-            refreshModeChips()
+            refreshMiniRinger()
             refreshRow(AudioManager.STREAM_RING, animate = true)
             refreshRow(AudioManager.STREAM_NOTIFICATION, animate = true)
         }, 120)
+    }
+
+    private fun refreshMiniRinger() {
+        val vibrate = try {
+            audio.ringerMode == AudioManager.RINGER_MODE_VIBRATE
+        } catch (_: Exception) {
+            false
+        }
+        miniRingerIcon?.setImageResource(if (vibrate) R.drawable.ic_vibrate else R.drawable.ic_ring)
+        miniRingerIcon?.contentDescription =
+            if (vibrate) "Vibrate, switch to ring" else "Ring, switch to vibrate"
     }
 
     private fun refreshRow(stream: Int, animate: Boolean) {
@@ -552,161 +580,233 @@ class VolumeOverlayService : android.app.Service() {
         val muted = silent || lockedByCall || isStreamMuted(stream)
         val visible = if (muted) 0 else getVolume(stream)
 
-        if (!row.slider.isDragging) {
-            row.slider.setValue(visible, animate)
-        }
-        row.slider.muted = muted
-        row.slider.isEnabled = !lockedByCall
-        row.slider.alpha = if (lockedByCall) 0.45f else 1f
+        if (!row.slider.isDragging) row.slider.setValue(visible, animate)
+        row.icon.alpha = if (muted) 0.45f else 1f
+        row.iconButtonDescription(row, muted)
 
-        row.percent.text = when {
-            lockedByCall -> "Muted by call"
-            silent -> "Silent"
-            muted -> "Muted"
-            else -> "${(getVolume(stream) * 100f / getMaxVolume(stream)).roundToInt()}%"
+        if (stream == AudioManager.STREAM_MUSIC && miniSlider?.isDragging != true) {
+            miniSlider?.max = getMaxVolume(stream)
+            miniSlider?.setValue(visible, animate)
         }
-        row.percent.setTextColor(if (muted) blue else textSecondary)
-        row.icon.imageTintList = ColorStateList.valueOf(if (muted) blue else iconIdle)
-        row.label.setTextColor(if (lockedByCall) textSecondary else textPrimary)
-        row.iconButton.contentDescription = if (muted) "Unmute ${row.def.label}" else "Mute ${row.def.label}"
+    }
+
+    private fun VolumeRow.iconButtonDescription(row: VolumeRow, muted: Boolean) {
+        (rows[row.def.stream] ?: return).icon.contentDescription =
+            if (muted) "Unmute ${row.def.label}" else "Mute ${row.def.label}"
     }
 
     private fun updateAllRows(animate: Boolean) {
         for (stream in rows.keys) refreshRow(stream, animate)
     }
 
-    private fun refreshModeChips() {
-        val current = try {
-            audio.ringerMode
-        } catch (_: Exception) {
-            AudioManager.RINGER_MODE_NORMAL
+    // ---------------------------------------------------------- geometry
+
+    private fun edgeX(w: Int): Int = if (onRightSide) screenW - w else 0
+
+    private fun coerceY(y: Int, h: Int, margin: Int = 0): Int {
+        val minY = margin.coerceAtLeast(0)
+        val maxY = (screenH - h - margin).coerceAtLeast(minY)
+        return y.coerceIn(minY, maxY)
+    }
+
+    private fun geometry(target: OverlayState, centerY: Int): Target = when (target) {
+        OverlayState.TAB -> {
+            val w = TAB_W_DP.dp()
+            val h = TAB_H_DP.dp()
+            Target(
+                target, w, h, edgeX(w), coerceY(centerY - h / 2, h),
+                intArrayOf(0, 0, 0, 0), 14f, TAB_BLUE, 0f,
+            )
         }
-        for ((mode, chip) in modeChips) {
-            val selected = mode == current
-            chip.container.background = if (selected) {
-                roundedDrawable(blue, 19, rippleDark)
-            } else {
-                roundedDrawable(Color.TRANSPARENT, 19, rippleLight)
-            }
-            val fg = if (selected) onBlue else iconIdle
-            chip.icon.imageTintList = ColorStateList.valueOf(fg)
-            chip.label.setTextColor(fg)
-            chip.container.contentDescription = chip.label.text.toString()
+        OverlayState.MINI -> {
+            val w = ref(MINI_W_REF)
+            val h = ref(MINI_H_REF)
+            val side = ref(42)
+            Target(
+                target, w, h, edgeX(w), coerceY(centerY - h / 2, h, EDGE_MARGIN_DP.dp()),
+                intArrayOf(side, side, ref(48), ref(24)), 28f, teal, 1f,
+            )
+        }
+        OverlayState.FULL -> {
+            val w = ref(FULL_W_REF)
+            val h = ref(FULL_H_REF)
+            val margin = EDGE_MARGIN_DP.dp()
+            val x = if (onRightSide) (screenW - w - margin).coerceAtLeast(0) else margin
+            Target(
+                target, w, h, x, coerceY(centerY - h / 2, h, margin),
+                intArrayOf(0, 0, 0, 0), 28f, teal, 1f,
+            )
         }
     }
 
-    // ---------------------------------------------------------- expand / collapse
+    private fun openWidth(): Int = when (state) {
+        OverlayState.FULL -> ref(FULL_W_REF)
+        OverlayState.MINI -> ref(MINI_W_REF)
+        OverlayState.TAB -> TAB_W_DP.dp()
+    }
 
-    private fun expand() {
-        if (isExpanded) return
-        isExpanded = true
-        android.util.Log.d("VolumeButtons", "expand edge=${if (onRightSide) "right" else "left"} y=${panelLp?.y}")
+    private fun openHeight(): Int = when (state) {
+        OverlayState.FULL -> ref(FULL_H_REF)
+        OverlayState.MINI -> ref(MINI_H_REF)
+        OverlayState.TAB -> TAB_H_DP.dp()
+    }
+
+    private fun Target.rect(): IntArray = intArrayOf(
+        x + margins[0],
+        y + margins[2],
+        w - margins[0] - margins[1],
+        h - margins[2] - margins[3],
+    )
+
+    /**
+     * Ease-out card resize inside the fixed full-screen window. No window
+     * layout changes happen per frame, so this stays smooth at 60fps.
+     */
+    private fun transitionTo(
+        target: OverlayState,
+        fadeIn: View?,
+        onEnd: (() -> Unit)? = null,
+    ) {
+        val surf = surface ?: return
+        val drawable = surfaceDrawable ?: return
+        val slp = surf.layoutParams as FrameLayout.LayoutParams
+
+        transition?.cancel()
+        val gen = ++transitionGeneration
+        val centerY = slp.topMargin + slp.height / 2
+        val to = geometry(target, centerY)
+        state = target
+
+        val fromRect = intArrayOf(slp.leftMargin, slp.topMargin, slp.width, slp.height)
+        val toRect = to.rect()
+        val fromRadius = surfaceRadius
+        val fromColor = surfaceColor
+        val fromAlpha = surf.alpha
+        val evaluator = ArgbEvaluator()
+
+        transition = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 280L
+            interpolator = DecelerateInterpolator(2.2f)
+            addUpdateListener { anim ->
+                val t = anim.animatedValue as Float
+                slp.leftMargin = lerp(fromRect[0], toRect[0], t)
+                slp.topMargin = lerp(fromRect[1], toRect[1], t)
+                slp.width = lerp(fromRect[2], toRect[2], t)
+                slp.height = lerp(fromRect[3], toRect[3], t)
+                surf.layoutParams = slp
+
+                surfaceRadius = lerp(fromRadius, to.radius, t)
+                drawable.cornerRadius = surfaceRadius * density
+                surfaceColor = evaluator.evaluate(t, fromColor, to.color) as Int
+                drawable.setColor(surfaceColor)
+                surf.alpha = lerp(fromAlpha, to.alpha, t)
+            }
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    if (gen != transitionGeneration) return
+                    transition = null
+                    fadeIn?.let { revealContent(it) }
+                    panelLp?.let { lp ->
+                        lp.x = toRect[0]
+                        lp.y = toRect[1]
+                    }
+                    persistGeometry()
+                    onEnd?.invoke()
+                }
+            })
+            start()
+        }
+    }
+
+    // ---------------------------------------------------------- state changes
+
+    private fun showMini() {
+        if (state == OverlayState.MINI) return
+        val fromFull = state == OverlayState.FULL
         cancelFade()
-        refreshModeChips()
+        refreshMiniRinger()
+        updateAllRows(animate = false)
+        openModalWindow()
+        if (fromFull) fadeOut(fullContent)
+        transitionTo(OverlayState.MINI, miniContent)
+    }
+
+    private fun showFull() {
+        if (state == OverlayState.FULL) return
+        cancelFade()
+        refreshMiniRinger()
         updateAllRows(animate = false)
         enforceCallNotifLink()
-
-        val root = rootView ?: return
-        val lp = panelLp ?: return
-        val w = panelWidthPx
-        lp.width = w
-        lp.x = expandedEdgeX(w)
-        lp.y = coerceY(lp.y, currentCardHeight(), EDGE_MARGIN_DP.dp())
-        applyBlur(true)
-        updateWindowSafe(root, lp)
-
-        expandedView?.post {
-            val h = expandedView?.height ?: 0
-            if (h > 0) {
-                val y = coerceY(lp.y, h, EDGE_MARGIN_DP.dp())
-                if (y != lp.y) {
-                    lp.y = y
-                    rootView?.let { updateWindowSafe(it, lp) }
-                }
-            }
-        }
-
-        scrimLp?.let { slp ->
-            slp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-            slp.alpha = 1f
-            scrimView?.let { updateWindowSafe(it, slp) }
-        }
-        scrimView?.animate()?.alpha(1f)?.setDuration(200)?.start()
-
-        collapsedView?.let { btn ->
-            btn.animate().alpha(0f).setDuration(120).withEndAction {
-                btn.visibility = View.GONE
-                btn.alpha = COLLAPSED_ALPHA
-            }.start()
-        }
-
-        expandedView?.let { card ->
-            card.visibility = View.VISIBLE
-            card.alpha = 0f
-            card.translationX = if (onRightSide) 26.dp().toFloat() else -26.dp().toFloat()
-            card.scaleX = 0.97f
-            card.scaleY = 0.97f
-            card.pivotX = if (onRightSide) w.toFloat() else 0f
-            card.pivotY = 0f
-            card.animate()
-                .alpha(1f)
-                .translationX(0f)
-                .scaleX(1f)
-                .scaleY(1f)
-                .setDuration(220)
-                .setInterpolator(DecelerateInterpolator(1.6f))
-                .start()
-        }
+        openModalWindow()
+        fadeOut(miniContent)
+        transitionTo(OverlayState.FULL, fullContent)
     }
 
     private fun collapse() {
-        if (!isExpanded) return
-        isExpanded = false
-        android.util.Log.d("VolumeButtons", "collapse")
+        if (state == OverlayState.TAB) return
         cancelFade()
-
-        scrimView?.animate()?.alpha(0f)?.setDuration(170)?.start()
-        scrimLp?.let { slp ->
-            slp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-            slp.alpha = 0.79f
-            scrimView?.let { updateWindowSafe(it, slp) }
+        val closing = if (state == OverlayState.FULL) fullContent else miniContent
+        fadeOut(closing)
+        val slp = surface?.layoutParams as? FrameLayout.LayoutParams
+        val centerY = if (slp != null) slp.topMargin + slp.height / 2 else screenH / 2
+        transitionTo(OverlayState.TAB, null) {
+            closeModalWindow(centerY)
+            tabView?.let { btn -> btn.alpha = COLLAPSED_ALPHA }
+            scheduleFade()
         }
+    }
 
-        expandedView?.let { card ->
-            card.animate()
-                .alpha(0f)
-                .translationX(if (onRightSide) 22.dp().toFloat() else -22.dp().toFloat())
-                .scaleX(0.98f)
-                .scaleY(0.98f)
-                .setDuration(150)
-                .setInterpolator(DecelerateInterpolator())
-                .withEndAction {
-                    card.visibility = View.GONE
-                    card.alpha = 1f
-                    card.translationX = 0f
-                    card.scaleX = 1f
-                    card.scaleY = 1f
-                    applyBlur(false)
-                    val root = rootView
-                    val lp = panelLp
-                    if (root != null && lp != null) {
-                        val w = BUTTON_DP.dp()
-                        lp.width = w
-                        lp.x = edgeX(w)
-                        lp.y = coerceY(lp.y, BUTTON_HEIGHT_DP.dp())
-                        updateWindowSafe(root, lp)
-                    }
-                    collapsedView?.let { btn ->
-                        btn.setImageResource(tabChevron())
-                        btn.setBackgroundResource(tabBackground())
-                        btn.visibility = View.VISIBLE
-                        btn.alpha = 0f
-                        btn.animate().alpha(COLLAPSED_ALPHA).setDuration(170).start()
-                    }
-                    persistGeometry()
-                    scheduleFade()
-                }
-                .start()
+    private fun revealContent(view: View?) {
+        view ?: return
+        view.visibility = View.VISIBLE
+        view.alpha = 0f
+        view.animate().alpha(1f).setDuration(120)
+            .setInterpolator(DecelerateInterpolator()).start()
+    }
+
+    private fun fadeOut(view: View?) {
+        view ?: return
+        view.animate().cancel()
+        if (view.visibility != View.VISIBLE) return
+        view.animate().alpha(0f).setDuration(100)
+            .withEndAction { view.visibility = View.GONE }.start()
+    }
+
+    private fun hideContent(view: View) {
+        view.visibility = View.GONE
+        view.alpha = 0f
+    }
+
+    private fun openModalWindow() {
+        scrimLp?.let { lp ->
+            lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            lp.alpha = 1f
+            scrimView?.let { updateWindowSafe(it, lp) }
+        }
+        rootView?.let { rv ->
+            panelLp?.let { lp ->
+                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                updateWindowSafe(rv, lp)
+            }
+        }
+        tabView?.alpha = 0f
+    }
+
+    private fun closeModalWindow(centerY: Int) {
+        val tab = geometry(OverlayState.TAB, centerY)
+        panelLp?.let { lp ->
+            lp.x = tab.x
+            lp.y = tab.y
+            lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+            rootView?.let { updateWindowSafe(it, lp) }
+        }
+        tabView?.alpha = COLLAPSED_ALPHA
+        scrimLp?.let { lp ->
+            lp.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            lp.alpha = 0.79f
+            scrimView?.let { updateWindowSafe(it, lp) }
         }
     }
 
@@ -720,6 +820,7 @@ class VolumeOverlayService : android.app.Service() {
 
     private fun attachDrag(view: View) {
         view.setOnTouchListener { v, event ->
+            if (transition?.isRunning == true) return@setOnTouchListener true
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     dragStartRawX = event.rawX
@@ -727,20 +828,16 @@ class VolumeOverlayService : android.app.Service() {
                     dragStartLpX = panelLp?.x ?: 0
                     dragStartLpY = panelLp?.y ?: 0
                     dragged = false
-                    v.isPressed = true
                     pokeAlpha()
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = event.rawX - dragStartRawX
                     val dy = event.rawY - dragStartRawY
-                    if (!dragged && hypot(dx, dy) > 8 * density) {
-                        dragged = true
-                        pokeAlpha()
-                    }
+                    if (!dragged && hypot(dx, dy) > 8 * density) dragged = true
                     if (dragged) {
-                        val viewW = if (isExpanded) panelWidthPx else BUTTON_DP.dp()
-                        val viewH = if (isExpanded) currentCardHeight() else BUTTON_HEIGHT_DP.dp()
+                        val viewW = openWidth()
+                        val viewH = openHeight()
                         panelLp?.let { lp ->
                             lp.x = (dragStartLpX + dx).toInt().coerceIn(0, (screenW - viewW).coerceAtLeast(0))
                             lp.y = (dragStartLpY + dy).toInt().coerceIn(0, (screenH - viewH).coerceAtLeast(0))
@@ -750,13 +847,12 @@ class VolumeOverlayService : android.app.Service() {
                     true
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    v.isPressed = false
                     if (dragged) {
                         snapToNearestEdge()
                         dragged = false
                         scheduleFade()
-                    } else if (v is ImageView && !isExpanded) {
-                        expand()
+                    } else if (v === tabView && state == OverlayState.TAB) {
+                        showMini()
                     }
                     true
                 }
@@ -766,38 +862,35 @@ class VolumeOverlayService : android.app.Service() {
     }
 
     private fun snapToNearestEdge() {
-        val viewW = if (isExpanded) panelWidthPx else BUTTON_DP.dp()
+        val viewW = openWidth()
         val lp = panelLp ?: return
         val root = rootView ?: return
-        val margin = if (isExpanded) EDGE_MARGIN_DP.dp() else 0
+        val margin = if (state == OverlayState.TAB) 0 else EDGE_MARGIN_DP.dp()
         val targetX = if (lp.x + viewW / 2 < screenW / 2) {
             margin
         } else {
             (screenW - viewW - margin).coerceAtLeast(0)
         }
-        android.util.Log.d("VolumeButtons", "snap from=(${lp.x},${lp.y}) to=$targetX")
         onRightSide = targetX > screenW / 2
-        collapsedView?.apply {
+        tabView?.apply {
             setImageResource(tabChevron())
             setBackgroundResource(tabBackground())
         }
-        if (isExpanded) {
-            val y = coerceY(lp.y, currentCardHeight(), margin)
-            lp.y = y
+        if (state != OverlayState.TAB) {
+            lp.y = coerceY(lp.y, openHeight(), margin)
         }
-        val animator = android.animation.ValueAnimator.ofInt(lp.x, targetX)
-        animator.duration = 220
-        animator.interpolator = DecelerateInterpolator()
-        animator.addUpdateListener { va ->
-            lp.x = va.animatedValue as Int
-            updateWindowSafe(root, lp)
-        }
-        animator.addListener(object : android.animation.AnimatorListenerAdapter() {
-            override fun onAnimationEnd(animation: android.animation.Animator) {
-                persistGeometry()
+        ValueAnimator.ofInt(lp.x, targetX).apply {
+            duration = 220
+            interpolator = DecelerateInterpolator()
+            addUpdateListener {
+                lp.x = it.animatedValue as Int
+                updateWindowSafe(root, lp)
             }
-        })
-        animator.start()
+            addListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) = persistGeometry()
+            })
+            start()
+        }
     }
 
     private fun persistGeometry() {
@@ -809,43 +902,24 @@ class VolumeOverlayService : android.app.Service() {
         }
     }
 
-    private fun currentCardHeight(): Int {
-        val measured = expandedView?.height ?: 0
-        return if (measured > 0) measured else 500.dp()
-    }
-
-    private fun edgeX(viewW: Int): Int = if (onRightSide) screenW - viewW else 0
-
-    private fun expandedEdgeX(viewW: Int): Int {
-        val margin = EDGE_MARGIN_DP.dp()
-        return if (onRightSide) (screenW - viewW - margin).coerceAtLeast(0) else margin
-    }
-
     private fun tabBackground(): Int =
         if (onRightSide) R.drawable.overlay_tab_bg_right else R.drawable.overlay_tab_bg_left
 
     private fun tabChevron(): Int =
         if (onRightSide) R.drawable.ic_chevron_left else R.drawable.ic_chevron_right
 
-    private fun coerceY(y: Int, viewH: Int, margin: Int = 0): Int {
-        val minY = margin.coerceAtLeast(0)
-        val maxY = (screenH - viewH - margin).coerceAtLeast(minY)
-        return y.coerceIn(minY, maxY)
-    }
-
     // ---------------------------------------------------------- idle fade
 
     private fun pokeAlpha() {
         cancelFade()
-        expandedView?.let { if (it.visibility == View.VISIBLE) it.alpha = 1f }
-        collapsedView?.let { if (it.visibility == View.VISIBLE) it.alpha = COLLAPSED_ALPHA }
+        tabView?.let { if (it.visibility == View.VISIBLE) it.alpha = COLLAPSED_ALPHA }
     }
 
     private fun scheduleFade() {
         cancelFade()
-        if (isExpanded) return
+        if (state != OverlayState.TAB) return
         fadeRunnable = Runnable {
-            collapsedView?.animate()?.alpha(COLLAPSED_IDLE_ALPHA)?.setDuration(450)?.start()
+            tabView?.animate()?.alpha(COLLAPSED_IDLE_ALPHA)?.setDuration(450)?.start()
         }
         handler.postDelayed(fadeRunnable!!, FADE_DELAY_MS)
     }
@@ -853,45 +927,6 @@ class VolumeOverlayService : android.app.Service() {
     private fun cancelFade() {
         fadeRunnable?.let { handler.removeCallbacks(it) }
         fadeRunnable = null
-    }
-
-    // ---------------------------------------------------------- blur
-
-    private fun crossWindowBlurAvailable(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
-        return try {
-            wm.isCrossWindowBlurEnabled
-        } catch (_: Throwable) {
-            false
-        }
-    }
-
-    private fun applyCardSurface() {
-        // With blur we can afford a hint of translucency; without it the card must stay readable.
-        val alpha = if (crossWindowBlurAvailable()) 0xF2 else 0xFF
-        val bg = GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = 28f * density
-            setColor((alpha shl 24) or 0x1E1F22)
-            setStroke((1f * density).toInt().coerceAtLeast(1), Color.parseColor("#1FFFFFFF"))
-        }
-        expandedView?.background = bg
-    }
-
-    private fun applyBlur(enabled: Boolean) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-        val lp = panelLp ?: return
-        try {
-            if (enabled && wm.isCrossWindowBlurEnabled) {
-                lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-                lp.setBlurBehindRadius(28.dp())
-            } else {
-                lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
-                lp.setBlurBehindRadius(0)
-            }
-        } catch (_: Throwable) {
-            // Blur is a visual bonus; the translucent card still looks right without it.
-        }
     }
 
     // ---------------------------------------------------------- observers
@@ -910,7 +945,7 @@ class VolumeOverlayService : android.app.Service() {
     }
 
     private val ringerSync = Runnable {
-        refreshModeChips()
+        refreshMiniRinger()
         refreshRow(AudioManager.STREAM_RING, animate = true)
         refreshRow(AudioManager.STREAM_NOTIFICATION, animate = true)
     }
@@ -929,7 +964,6 @@ class VolumeOverlayService : android.app.Service() {
                 Settings.Global.getUriFor(Settings.Global.MODE_RINGER), false, ringerObserver,
             )
         } catch (_: Exception) {
-            // Observers are a convenience; sliders still work without them.
         }
     }
 
@@ -956,39 +990,52 @@ class VolumeOverlayService : android.app.Service() {
         return RippleDrawable(ColorStateList.valueOf(rippleColor), content, mask)
     }
 
+    private fun ovalDrawable(color: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(color)
+    }
+
+    private fun ovalRipple(color: Int): RippleDrawable {
+        val content = ovalDrawable(color)
+        val mask = ovalDrawable(Color.WHITE)
+        return RippleDrawable(ColorStateList.valueOf(rippleLight), content, mask)
+    }
+
     // ---------------------------------------------------------- window helpers
 
-    private fun addWindowSafe(view: View, lp: WindowManager.LayoutParams): Boolean {
-        return try {
-            wm.addView(view, lp)
-            true
-        } catch (se: SecurityException) {
-            stopSelf()
-            false
-        } catch (e: IllegalArgumentException) {
-            false
-        }
+    private fun addWindowSafe(view: View, lp: WindowManager.LayoutParams): Boolean = try {
+        wm.addView(view, lp)
+        true
+    } catch (se: SecurityException) {
+        stopSelf()
+        false
+    } catch (e: IllegalArgumentException) {
+        false
     }
 
-    private fun updateWindowSafe(view: View, lp: WindowManager.LayoutParams): Boolean {
-        return try {
-            wm.updateViewLayout(view, lp)
-            true
-        } catch (se: SecurityException) {
-            stopSelf()
-            false
-        } catch (e: IllegalArgumentException) {
-            false
-        }
+    private fun updateWindowSafe(view: View, lp: WindowManager.LayoutParams): Boolean = try {
+        wm.updateViewLayout(view, lp)
+        true
+    } catch (se: SecurityException) {
+        stopSelf()
+        false
+    } catch (e: IllegalArgumentException) {
+        false
     }
 
-    // ---------------------------------------------------------- foreground notification
+    // ---------------------------------------------------------- notification (hidden)
 
     private fun createNotificationChannel() {
+        // IMPORTANCE_NONE keeps the foreground service alive without showing a
+        // notification in the shade or status bar.
+        // The channel may already exist from an older build with a visible
+        // importance; delete it first so the hidden channel actually applies.
+        (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+            .deleteNotificationChannel(CHANNEL_ID)
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Floating volume button",
-            NotificationManager.IMPORTANCE_LOW,
+            NotificationManager.IMPORTANCE_NONE,
         ).apply {
             description = "Keeps the floating volume button alive"
             setShowBadge(false)
@@ -1003,7 +1050,7 @@ class VolumeOverlayService : android.app.Service() {
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_volume)
             .setContentTitle("Volume Buttons")
-            .setContentText("Floating sound controls are active — tap the edge tab")
+            .setContentText("Floating sound controls are active")
             .setContentIntent(tapIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -1013,6 +1060,7 @@ class VolumeOverlayService : android.app.Service() {
 
     override fun onDestroy() {
         cancelFade()
+        transition?.cancel()
         unregisterObservers()
         handler.removeCallbacks(volumeSync)
         handler.removeCallbacks(ringerSync)
